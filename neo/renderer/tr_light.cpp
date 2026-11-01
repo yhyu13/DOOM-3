@@ -1296,6 +1296,12 @@ void R_AddDrawSurf( const srfTriangles_t *tri, const viewEntity_t *space, const 
 	}
 
 	if ( gui ) {
+		// O-12: this is an in-world GUI surface. Record the fact where the material and the
+		// space are both known (the same resolution the GL backend relies on) so the ordered
+		// classic path can classify it without touching space->entityDef, which the back end
+		// is not allowed to reference (viewEntity_s comment).
+		drawSurf->dsFlags |= DSF_GUI_SURFACE;
+
 		// force guis on the fast time
 		float oldFloatTime;
 		int oldTime;

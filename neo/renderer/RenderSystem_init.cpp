@@ -87,6 +87,12 @@ idCVar r_brightness( "r_brightness", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FL
 
 idCVar r_renderer( "r_renderer", "best", CVAR_RENDERER | CVAR_ARCHIVE, "hardware specific renderer path to use", r_rendererArgs, idCmdSystem::ArgCompletion_String<r_rendererArgs> );
 
+// spec 004 (Q2). r_renderer keeps its GL sub-path meaning; the API selection is separate.
+// A failed D3D12 initialization never rewrites this value and never switches path on its
+// own: the next launch has to ask for r_renderApi 0 explicitly (engine-integration.md 5.3.6).
+idCVar r_renderApi( "r_renderApi", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "render API: 0 = OpenGL reference, 1 = D3D12 classic (spec 004)", 0, 1, idCmdSystem::ArgCompletion_Integer<0,1> );
+idCVar r_showRenderApiTrace( "r_showRenderApiTrace", "0", CVAR_RENDERER | CVAR_INTEGER, "print the ordered classic scene stream the engine emitted (0 off, 1 on)", 0, 1, idCmdSystem::ArgCompletion_Integer<0,1> );
+
 idCVar r_jitter( "r_jitter", "0", CVAR_RENDERER | CVAR_BOOL, "randomly subpixel jitter the projection matrix" );
 
 idCVar r_skipSuppress( "r_skipSuppress", "0", CVAR_RENDERER | CVAR_BOOL, "ignore the per-view suppressions" );
@@ -1868,6 +1874,197 @@ extern	PFNWGLSWAPINTERVALEXTPROC wglSwapIntervalEXT;
 }
 
 /*
+================================================================================
+
+	spec 004 (Q2): render API selection, typed failure and the classic scene seam.
+
+	Engine-integration.md sections 5.1-5.3.3 and 5.4. The selection is separate from
+	r_renderer, "running" is backend neutral, and a failed D3D12 initialization is
+	reported as a typed result without rewriting r_renderApi or switching paths.
+
+================================================================================
+*/
+
+static const q2SceneSink_t *	r_q2SceneSink = NULL;
+static int						r_q2TraceCounters[Q2_TRACE_COUNTERS];
+
+/*
+=================
+R_SetQ2SceneSink
+
+The port installs its backend-neutral consumer here. There is no static-initializer
+self-registration: a linker may drop an unreferenced object in a static library
+(engine-integration.md 4.4).
+=================
+*/
+void R_SetQ2SceneSink( const q2SceneSink_t *sink ) {
+	r_q2SceneSink = sink;
+}
+
+const q2SceneSink_t *R_Q2SceneSink( void ) {
+	return r_q2SceneSink;
+}
+
+void R_Q2TraceAdd( q2TraceCounter_t counter ) {
+	if ( counter >= 0 && counter < Q2_TRACE_COUNTERS ) {
+		r_q2TraceCounters[counter]++;
+	}
+}
+
+void R_Q2TraceReset( void ) {
+	memset( r_q2TraceCounters, 0, sizeof( r_q2TraceCounters ) );
+}
+
+void R_Q2TracePrint( const char *label ) {
+	common->Printf( "Q2 trace %s: views %d, overlays %d, draws %d, lights %d, refused %d, copies %d, targets %d, swaps %d\n",
+		label ? label : "",
+		r_q2TraceCounters[Q2_TRACE_VIEW], r_q2TraceCounters[Q2_TRACE_OVERLAY],
+		r_q2TraceCounters[Q2_TRACE_DRAW], r_q2TraceCounters[Q2_TRACE_LIGHT],
+		r_q2TraceCounters[Q2_TRACE_REFUSED], r_q2TraceCounters[Q2_TRACE_COPY],
+		r_q2TraceCounters[Q2_TRACE_TARGET], r_q2TraceCounters[Q2_TRACE_SWAP] );
+	R_Q2TraceReset();
+}
+
+const char *R_RenderApiName( renderApi_t api ) {
+	switch ( api ) {
+		case RENDER_API_GL:		return "opengl";
+		case RENDER_API_D3D12:	return "d3d12";
+	}
+	return "unknown";
+}
+
+const char *R_RenderApiStageName( renderApiStage_t stage ) {
+	switch ( stage ) {
+		case RA_STAGE_NONE:			return "none";
+		case RA_STAGE_SELECTION:	return "selection";
+		case RA_STAGE_COMMAND:		return "command";
+		case RA_STAGE_DEVICE:		return "device";
+		case RA_STAGE_SURFACE:		return "surface";
+		case RA_STAGE_PIPELINE:		return "pipeline";
+		case RA_STAGE_SCENE_SINK:	return "scene-sink";
+		case RA_STAGE_DEVICE_LOST:	return "device-lost";
+	}
+	return "unknown";
+}
+
+renderApi_t R_RenderApiSelected( void ) {
+	return (renderApi_t)r_renderApi.GetInteger();
+}
+
+bool R_RenderApiSelectionValid( void ) {
+	const int value = r_renderApi.GetInteger();
+	return value == RENDER_API_GL || value == RENDER_API_D3D12;
+}
+
+bool R_ModernRenderApiRunning( void ) {
+	return tr.modernRenderApiRunning;
+}
+
+bool R_RenderSystemRunning( void ) {
+	// GL -> glConfig.isInitialized; modern -> device + surface + resources ready.
+	return glConfig.isInitialized || tr.modernRenderApiRunning;
+}
+
+const renderApiResult_t *R_RenderApiFailure( void ) {
+	return &tr.renderApiFailure;
+}
+
+void R_RenderApiFail( renderApiStage_t stage, const char *detail ) {
+	tr.renderApiFailure.stage = stage;
+	idStr::Copynz( tr.renderApiFailure.detail, detail ? detail : "",
+		(int)sizeof( tr.renderApiFailure.detail ) );
+	common->Warning( "render API %s (%s): %s", R_RenderApiName( tr.renderApi ),
+		R_RenderApiStageName( stage ), tr.renderApiFailure.detail );
+}
+
+/*
+=================
+R_InitRenderApi
+
+Called once for the launch and again after a full vid_restart. On the GL path this is
+the existing R_InitOpenGL(), unchanged. On the D3D12 path no GL entry point is called.
+=================
+*/
+void R_InitRenderApi( void ) {
+	tr.modernRenderApiRunning = false;
+	tr.renderApiFailure.stage = RA_STAGE_NONE;
+	tr.renderApiFailure.detail[0] = '\0';
+
+	const int value = r_renderApi.GetInteger();
+	if ( value != RENDER_API_GL && value != RENDER_API_D3D12 ) {
+		// Reject the value instead of silently clamping it: a typo must not pick a path.
+		tr.renderApi = RENDER_API_GL;
+		R_RenderApiFail( RA_STAGE_SELECTION,
+			"r_renderApi is not a known value; accepted values are 0 (OpenGL reference) and "
+			"1 (D3D12 classic). The cvar was left unchanged and no renderer was started." );
+		return;
+	}
+
+	tr.renderApi = (renderApi_t)value;
+
+	if ( tr.renderApi == RENDER_API_GL ) {
+		R_InitOpenGL();
+		return;
+	}
+
+	// D3D12. Window creation belongs to GLimp_Init for the GL reference path; this build
+	// has no D3D12 window/surface path, so there is no size and no surface to present to.
+	if ( glConfig.vidWidth <= 0 || glConfig.vidHeight <= 0 ) {
+		R_RenderApiFail( RA_STAGE_SURFACE,
+			"no window or surface exists on the D3D12 classic path: window creation is owned by "
+			"GLimp_Init for the OpenGL reference path and no D3D12 surface path is delivered in "
+			"this build. r_renderApi was not changed; relaunch with r_renderApi 0." );
+		return;
+	}
+
+	const q2SceneSink_t *sink = R_Q2SceneSink();
+	if ( sink == NULL || sink->initialize == NULL ) {
+		R_RenderApiFail( RA_STAGE_SCENE_SINK,
+			"r_renderApi 1 selected the D3D12 classic path, but no backend-neutral scene consumer "
+			"is installed in this build (spec 004 T035/T080: the portable RHI still accepts no "
+			"geometry or texture submission). r_renderApi was not changed; relaunch with "
+			"r_renderApi 0 for the OpenGL reference path." );
+		return;
+	}
+
+	char reason[512];
+	reason[0] = '\0';
+	if ( !sink->initialize( sink->user, glConfig.vidWidth, glConfig.vidHeight, reason,
+			(int)sizeof( reason ) ) ) {
+		R_RenderApiFail( RA_STAGE_DEVICE,
+			reason[0] ? reason : "the classic scene consumer refused to initialize" );
+		return;
+	}
+
+	tr.modernRenderApiRunning = true;
+	common->Printf( "D3D12 classic path initialized at %dx%d\n", glConfig.vidWidth, glConfig.vidHeight );
+}
+
+/*
+=================
+R_ShutdownRenderApi
+
+Retires whichever API is running. A modern consumer is shut down through the sink; the GL
+path keeps its existing GLimp_Shutdown/glConfig pairing.
+=================
+*/
+void R_ShutdownRenderApi( void ) {
+	if ( tr.modernRenderApiRunning ) {
+		const q2SceneSink_t *sink = R_Q2SceneSink();
+		if ( sink != NULL && sink->shutdown != NULL ) {
+			sink->shutdown( sink->user );
+		}
+		tr.modernRenderApiRunning = false;
+		R_Q2ResetImageRegistry();
+		return;
+	}
+
+	if ( glConfig.isInitialized ) {
+		tr.ShutdownOpenGL();
+	}
+}
+
+/*
 =================
 R_VidRestart_f
 =================
@@ -1875,8 +2072,8 @@ R_VidRestart_f
 void R_VidRestart_f( const idCmdArgs &args ) {
 	int	err;
 
-	// if OpenGL isn't started, do nothing
-	if ( !glConfig.isInitialized ) {
+	// if no render API is running, do nothing
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 
@@ -1916,20 +2113,23 @@ void R_VidRestart_f( const idCmdArgs &args ) {
 		soundSystem->ShutdownHW();
 		Sys_ShutdownInput();
 		globalImages->PurgeAllImages();
-		// free the context and close the window
-		GLimp_Shutdown();
-		glConfig.isInitialized = false;
+		// retire the selected API (the GL context, or the classic scene consumer)
+		R_ShutdownRenderApi();
 
-		// create the new context and vertex cache
+		// create the new context / consumer and vertex cache
 		bool latch = cvarSystem->GetCVarBool( "r_fullscreen" );
 		if ( forceWindow ) {
 			cvarSystem->SetCVarBool( "r_fullscreen", false );
 		}
-		R_InitOpenGL();
+		R_InitRenderApi();
 		cvarSystem->SetCVarBool( "r_fullscreen", latch );
 
 		// regenerate all images
 		globalImages->ReloadAllImages();
+	} else if ( !glConfig.isInitialized ) {
+		// A partial restart only rescales the GL screen parms. The D3D12 classic path
+		// has no surface resize here; say so instead of calling a GL function.
+		common->Warning( "vid_restart partial: the D3D12 classic path has no screen-parms resize; use vid_restart" );
 	} else {
 		glimpParms_t	parms;
 		parms.width = glConfig.vidWidth;
@@ -1950,10 +2150,12 @@ void R_VidRestart_f( const idCmdArgs &args ) {
 	// regenerate all necessary interactions
 	R_RegenerateWorld_f( idCmdArgs() );
 
-	// check for problems
-	err = qglGetError();
-	if ( err != GL_NO_ERROR ) {
-		common->Printf( "glGetError() = 0x%x\n", err );
+	// check for problems (GL-only: the classic path reports through its typed failure)
+	if ( glConfig.isInitialized ) {
+		err = qglGetError();
+		if ( err != GL_NO_ERROR ) {
+			common->Printf( "glGetError() = 0x%x\n", err );
+		}
 	}
 
 	// start sound playing again
@@ -2042,10 +2244,36 @@ void R_InitCvars( void ) {
 
 /*
 =================
+R_RenderApiStatus_f
+
+Prints the selected path, whether it is running and, when it is not, the typed reason.
+This is the human-readable half of the T036/T083 diagnostic; the engine does not act on it.
+=================
+*/
+static void R_RenderApiStatus_f( const idCmdArgs &args ) {
+	const renderApiResult_t *failure = R_RenderApiFailure();
+	common->Printf( "r_renderApi %d (%s): %s\n", r_renderApi.GetInteger(),
+		R_RenderApiName( R_RenderApiSelected() ),
+		R_RenderSystemRunning() ? "running" : "not running" );
+	if ( !R_RenderApiSelectionValid() ) {
+		common->Printf( "  selection: invalid; accepted values are 0 and 1\n" );
+	}
+	if ( failure->stage != RA_STAGE_NONE ) {
+		common->Printf( "  failure: %s: %s\n", R_RenderApiStageName( failure->stage ),
+			failure->detail );
+	}
+	common->Printf( "  opengl context: %s, d3d12 classic: %s\n",
+		glConfig.isInitialized ? "running" : "not running",
+		tr.modernRenderApiRunning ? "running" : "not running" );
+}
+
+/*
+=================
 R_InitCommands
 =================
 */
 void R_InitCommands( void ) {
+	cmdSystem->AddCommand( "renderapi_status", R_RenderApiStatus_f, CMD_FL_RENDERER, "prints the render API selection, state and typed failure" );
 	cmdSystem->AddCommand( "MakeMegaTexture", idMegaTexture::MakeMegaTexture_f, CMD_FL_RENDERER|CMD_FL_CHEAT, "processes giant images" );
 	cmdSystem->AddCommand( "sizeUp", R_SizeUp_f, CMD_FL_RENDERER, "makes the rendered view larger" );
 	cmdSystem->AddCommand( "sizeDown", R_SizeDown_f, CMD_FL_RENDERER, "makes the rendered view smaller" );
@@ -2182,7 +2410,7 @@ void idRenderSystemLocal::Shutdown( void ) {
 
 	R_DoneFreeType( );
 
-	if ( glConfig.isInitialized ) {
+	if ( R_RenderSystemRunning() ) {
 		globalImages->PurgeAllImages();
 	}
 
@@ -2214,7 +2442,7 @@ void idRenderSystemLocal::Shutdown( void ) {
 
 	Clear();
 
-	ShutdownOpenGL();
+	R_ShutdownRenderApi();
 }
 
 /*
@@ -2246,17 +2474,20 @@ idRenderSystemLocal::InitOpenGL
 ========================
 */
 void idRenderSystemLocal::InitOpenGL( void ) {
-	// if OpenGL isn't started, start it now
-	if ( !glConfig.isInitialized ) {
+	// if no render API is started, select and start the requested one now
+	if ( !R_RenderSystemRunning() ) {
 		int	err;
 
-		R_InitOpenGL();
+		R_InitRenderApi();
 
-		globalImages->ReloadAllImages();
+		// image reload and the GL error check belong to the GL path only
+		if ( glConfig.isInitialized ) {
+			globalImages->ReloadAllImages();
 
-		err = qglGetError();
-		if ( err != GL_NO_ERROR ) {
-			common->Printf( "glGetError() = 0x%x\n", err );
+			err = qglGetError();
+			if ( err != GL_NO_ERROR ) {
+				common->Printf( "glGetError() = 0x%x\n", err );
+			}
 		}
 	}
 }

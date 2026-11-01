@@ -676,7 +676,7 @@ void idRenderWorldLocal::RenderScene( const renderView_t *renderView ) {
 #ifndef	ID_DEDICATED
 	renderView_t	copy;
 
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 
@@ -1443,7 +1443,7 @@ use it as an oportunity to size the interactionTable
 ===================
 */
 void idRenderWorldLocal::GenerateAllInteractions() {
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 

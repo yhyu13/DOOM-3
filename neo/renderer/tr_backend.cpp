@@ -589,6 +589,330 @@ const void	RB_CopyRender( const void *data ) {
 }
 
 /*
+================================================================================
+
+	spec 004 (Q2): the D3D12 classic command path (T035, T080-T082).
+
+	The front end already produced the sorted drawSurfs array and the viewLight
+	lists. This block consumes them in that order and hands a value-only frame to
+	the port's backend-neutral consumer. It translates the three legacy shapes at
+	the boundary (engine-integration.md 5.4):
+
+	  setBufferCommand_t.buffer	is a GL order code -> 0 current / 1 offscreen
+	  copyRenderCommand_t.image	is an idImage*      -> a stable numeric identity
+	  drawSurf_t.sort			is preserved       -> the consumer must not re-sort
+	  tri->ambientCache			is never read; only numVerts/numIndexes cross
+
+	No GL entry point runs here. A refused callback stops the frame; the engine
+	reports the typed reason and never presents a partial frame.
+
+================================================================================
+*/
+
+// GL order codes carried by setBufferCommand_t. Spelled as values so this block
+// does not look like a GL call site.
+static const GLenum	Q2_BUFFER_FRONT = 0x0404;
+static const GLenum	Q2_BUFFER_BACK = 0x0405;
+
+extern idCVar r_showRenderApiTrace;
+
+static int						r_q2ViewSerial;
+static int						r_q2SurfaceSerial;
+static idList<const idImage *>	r_q2ImageRegistry;
+
+void R_Q2ResetImageRegistry( void ) {
+	r_q2ImageRegistry.Clear();
+	r_q2ViewSerial = 0;
+	r_q2SurfaceSerial = 0;
+}
+
+static unsigned int RB_Q2ImageIdentity( const idImage *image ) {
+	if ( image == NULL ) {
+		return 0;
+	}
+	for ( int i = 0; i < r_q2ImageRegistry.Num(); i++ ) {
+		if ( r_q2ImageRegistry[i] == image ) {
+			return (unsigned int)( i + 1 );
+		}
+	}
+	r_q2ImageRegistry.Append( image );
+	return (unsigned int)r_q2ImageRegistry.Num();
+}
+
+static bool RB_Q2Refuse( renderApiStage_t stage, const char *detail ) {
+	R_Q2TraceAdd( Q2_TRACE_REFUSED );
+	R_RenderApiFail( stage, detail );
+	return false;
+}
+
+static int RB_Q2CountChain( const drawSurf_t *surf ) {
+	int count = 0;
+	for ( ; surf != NULL; surf = surf->nextOnLight ) {
+		count++;
+	}
+	return count;
+}
+
+// Material facts only. The plan (bump -> diffuse -> specular, coverage, refusal)
+// stays port-owned; this never decides that a stage is drawable.
+static void RB_Q2MaterialFacts( const idMaterial *material, q2MaterialFacts_t *facts ) {
+	memset( facts, 0, sizeof( *facts ) );
+	if ( material == NULL ) {
+		// A drawSurf with no material is a shadow volume (drawSurf_t.material may be NULL).
+		facts->name = "<shadow-volume>";
+		return;
+	}
+	facts->name = material->GetName();
+	facts->sort = material->GetSort();
+	facts->numStages = material->GetNumStages();
+	facts->coverage = (int)material->Coverage();
+	facts->alphaTest = material->Coverage() == MC_PERFORATED;
+	facts->translucent = material->Coverage() == MC_TRANSLUCENT;
+	facts->fogLight = material->IsFogLight();
+	facts->blendLight = material->IsBlendLight();
+	facts->noShadows = material->TestMaterialFlag( MF_NOSHADOWS );
+	facts->noSelfShadow = material->TestMaterialFlag( MF_NOSELFSHADOW );
+	facts->castsShadow = material->SurfaceCastsShadow();
+	for ( int i = 0; i < facts->numStages; i++ ) {
+		const shaderStage_t *stage = material->GetStage( i );
+		if ( stage->texture.image != NULL ) {
+			facts->hasTexture = true;
+		}
+		if ( stage->newStage != NULL ) {
+			facts->hasProgram = true;
+		}
+	}
+}
+
+static bool RB_Q2EmitDrawSurf( const q2SceneSink_t *sink, const drawSurf_t *surf,
+							  const viewDef_t *view ) {
+	if ( surf == NULL || surf->geo == NULL ) {
+		return RB_Q2Refuse( RA_STAGE_COMMAND, "a drawSurf reached the classic path without geometry" );
+	}
+
+	q2MaterialFacts_t facts;
+	RB_Q2MaterialFacts( surf->material, &facts );
+	facts.sort = surf->sort;	// the front end already applied the material/entity offset
+
+	// In-world GUI: R_AddDrawSurf resolves the material/space GUI and records DSF_GUI_SURFACE
+	// (tr_light.cpp:1283-1300), so the back end does not dereference space->entityDef and does
+	// not fall back to an SS_GUI sort comparison: drawSurf_t.sort carries tr.sortOffset
+	// (tr_light.cpp:1195-1200), so equality with SS_GUI would only match the first surface
+	// added in a frame. A display HUD is a separate 2D overlay view, not this flag.
+	const bool worldGui = ( view->viewEntitys != NULL ) &&
+		( ( surf->dsFlags & DSF_GUI_SURFACE ) != 0 );
+
+	// Depth-hack facts exactly as the GL path reads them (draw_common.cpp:749-754):
+	// the view projection is not pre-hacked, so the consumer applies the hack per packet.
+	// When both flags are set the GL path applies the weapon hack and then the model hack from
+	// the original projection, so the model hack is the effective one; match that precedence.
+	int depthHackKind = Q2_DEPTH_HACK_NONE;
+	float modelDepthHack = 0.0f;
+	if ( surf->space != NULL ) {
+		if ( surf->space->modelDepthHack != 0.0f ) {
+			depthHackKind = Q2_DEPTH_HACK_MODEL;
+			modelDepthHack = surf->space->modelDepthHack;
+		} else if ( surf->space->weaponDepthHack ) {
+			depthHackKind = Q2_DEPTH_HACK_WEAPON;
+		}
+	}
+
+	const bool postProcess = ( facts.sort >= (float)SS_POST_PROCESS );
+
+	if ( sink->drawPacket == NULL ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer has no draw callback" );
+	}
+	if ( !sink->drawPacket( sink->user, (unsigned int)( ++r_q2SurfaceSerial ), &facts,
+			surf->geo->numVerts, surf->geo->numIndexes, depthHackKind, modelDepthHack,
+			worldGui, postProcess ) ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer refused a draw packet" );
+	}
+
+	R_Q2TraceAdd( Q2_TRACE_DRAW );
+	return true;
+}
+
+static bool RB_Q2EmitViewLight( const q2SceneSink_t *sink, const viewLight_t *viewLight ) {
+	if ( viewLight->lightShader == NULL || viewLight->lightDef == NULL ) {
+		return RB_Q2Refuse( RA_STAGE_COMMAND, "a viewLight reached the classic path without a light" );
+	}
+
+	const renderLight_t &parms = viewLight->lightDef->parms;
+
+	q2LightFacts_t facts;
+	memset( &facts, 0, sizeof( facts ) );
+	facts.fogLight = viewLight->lightShader->IsFogLight();
+	facts.blendLight = viewLight->lightShader->IsBlendLight();
+	facts.pointLight = parms.pointLight;
+	facts.parallel = parms.parallel;
+	facts.hasProjection = ( parms.target - parms.origin ).LengthSqr() > 0.0f;
+	facts.noShadows = parms.noShadows;
+	facts.falloffRadius = parms.lightRadius.Length();
+	facts.numShadowFrustums = viewLight->lightDef->numShadowFrustums;
+	facts.globalShadows = RB_Q2CountChain( viewLight->globalShadows );
+	facts.localInteractions = RB_Q2CountChain( viewLight->localInteractions );
+	facts.localShadows = RB_Q2CountChain( viewLight->localShadows );
+	facts.globalInteractions = RB_Q2CountChain( viewLight->globalInteractions );
+	facts.translucentInteractions = RB_Q2CountChain( viewLight->translucentInteractions );
+
+	if ( sink->lightPacket == NULL ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer has no light callback" );
+	}
+	if ( !sink->lightPacket( sink->user, &facts ) ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer refused a viewLight" );
+	}
+
+	R_Q2TraceAdd( Q2_TRACE_LIGHT );
+	return true;
+}
+
+/*
+====================
+RB_Q2SubmitView
+
+The sorted drawSurfs array goes first (the consumer replays it for the depth fill,
+the interaction and the post-process phases), then each viewLight in viewLights
+order. That is the order the GL back end consumes the same data in
+(draw_common.cpp:1666-1725, draw_arb2.cpp:243-323).
+====================
+*/
+static bool RB_Q2SubmitView( const drawSurfsCommand_t *cmd ) {
+	const viewDef_t *view = cmd->viewDef;
+	const q2SceneSink_t *sink = R_Q2SceneSink();
+
+	if ( view == NULL ) {
+		return RB_Q2Refuse( RA_STAGE_COMMAND, "RC_DRAW_VIEW without a viewDef" );
+	}
+	if ( sink == NULL || sink->beginView == NULL ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer is not installed" );
+	}
+
+	// A 2D view has no viewEntities; it is the display overlay, drawn after the 3D scene.
+	const bool overlay = ( view->viewEntitys == NULL );
+	const int x = view->viewport.x1;
+	const int y = view->viewport.y1;
+	const int width = view->viewport.x2 - view->viewport.x1 + 1;
+	const int height = view->viewport.y2 - view->viewport.y1 + 1;
+	if ( width <= 0 || height <= 0 ) {
+		return RB_Q2Refuse( RA_STAGE_SURFACE, "RC_DRAW_VIEW has an empty viewport" );
+	}
+
+	const unsigned int viewId = (unsigned int)( ++r_q2ViewSerial );
+	// The projection is the unhacked viewDef projection. The weapon/model depth hack is a
+	// per-surface fact forwarded in drawPacket (draw_common.cpp:749-754, tr_render.cpp:176-206);
+	// the consumer applies it for that packet and restores the projection afterwards.
+	// `worldGui` at view level is false: the engine has no whole-GUI view, and an in-world GUI
+	// is a per-surface fact on the packet below.
+	if ( !sink->beginView( sink->user, viewId, x, y, width, height, overlay, false,
+			view->projectionMatrix ) ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer refused a view" );
+	}
+	R_Q2TraceAdd( overlay ? Q2_TRACE_OVERLAY : Q2_TRACE_VIEW );
+
+	for ( int i = 0; i < view->numDrawSurfs; i++ ) {
+		if ( !RB_Q2EmitDrawSurf( sink, view->drawSurfs[i], view ) ) {
+			return false;
+		}
+	}
+
+	for ( const viewLight_t *viewLight = view->viewLights; viewLight != NULL;
+			viewLight = viewLight->next ) {
+		if ( !RB_Q2EmitViewLight( sink, viewLight ) ) {
+			return false;
+		}
+	}
+
+	if ( sink->endView == NULL || !sink->endView( sink->user ) ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer refused to end a view" );
+	}
+	return true;
+}
+
+/*
+====================
+RB_Q2ExecuteBackEndCommands
+
+The modern counterpart of the GL loop. It keeps the existing FIFO and the RC_*
+order, including a mid-frame RC_COPY_RENDER position.
+====================
+*/
+static void RB_Q2ExecuteBackEndCommands( const emptyCommand_t *cmds ) {
+	const q2SceneSink_t *sink = R_Q2SceneSink();
+	bool ok = true;
+
+	for ( ; cmds != NULL && ok; cmds = (const emptyCommand_t *)cmds->next ) {
+		switch ( cmds->commandId ) {
+		case RC_NOP:
+			break;
+		case RC_DRAW_VIEW:
+			ok = RB_Q2SubmitView( (const drawSurfsCommand_t *)cmds );
+			break;
+		case RC_SET_BUFFER: {
+			const setBufferCommand_t *cmd = (const setBufferCommand_t *)cmds;
+			int selector;
+			if ( cmd->buffer == Q2_BUFFER_FRONT ) {
+				selector = 0;
+			} else if ( cmd->buffer == Q2_BUFFER_BACK ) {
+				selector = 1;
+			} else {
+				ok = RB_Q2Refuse( RA_STAGE_COMMAND,
+					"RC_SET_BUFFER carried a value the classic path does not accept" );
+				break;
+			}
+			if ( sink == NULL || sink->setColorTarget == NULL ||
+					!sink->setColorTarget( sink->user, selector ) ) {
+				ok = RB_Q2Refuse( RA_STAGE_COMMAND,
+					"the classic scene consumer refused a colour target" );
+				break;
+			}
+			R_Q2TraceAdd( Q2_TRACE_TARGET );
+			break;
+		}
+		case RC_COPY_RENDER: {
+			const copyRenderCommand_t *cmd = (const copyRenderCommand_t *)cmds;
+			const unsigned int imageId = RB_Q2ImageIdentity( cmd->image );
+			const char *imageName = ( cmd->image != NULL ) ? cmd->image->imgName.c_str() : NULL;
+			if ( imageId == 0 ) {
+				ok = RB_Q2Refuse( RA_STAGE_COMMAND,
+					"RC_COPY_RENDER carries no destination image" );
+				break;
+			}
+			if ( sink == NULL || sink->copyToImage == NULL ||
+					!sink->copyToImage( sink->user, imageId, imageName ) ) {
+				ok = RB_Q2Refuse( RA_STAGE_COMMAND,
+					"the classic scene consumer refused a frame copy" );
+				break;
+			}
+			R_Q2TraceAdd( Q2_TRACE_COPY );
+			break;
+		}
+		case RC_SWAP_BUFFERS:
+			if ( sink == NULL || sink->swapBuffers == NULL || !sink->swapBuffers( sink->user ) ) {
+				ok = RB_Q2Refuse( RA_STAGE_COMMAND,
+					"the classic scene consumer refused to present the frame" );
+				break;
+			}
+			R_Q2TraceAdd( Q2_TRACE_SWAP );
+			break;
+		default:
+			ok = RB_Q2Refuse( RA_STAGE_COMMAND, "RB_ExecuteBackEndCommands: bad commandId" );
+			break;
+		}
+	}
+
+	if ( r_showRenderApiTrace.GetInteger() ) {
+		R_Q2TracePrint( ok ? "frame" : "frame-refused" );
+	}
+}
+
+/*
 ====================
 RB_ExecuteBackEndCommands
 
@@ -606,6 +930,14 @@ void RB_ExecuteBackEndCommands( const emptyCommand_t *cmds ) {
 	}
 
 	backEndStartTime = Sys_Milliseconds();
+
+	if ( tr.modernRenderApiRunning ) {
+		// The D3D12 classic path: no GL default state, no GL image upload, no qglBindTexture.
+		RB_Q2ExecuteBackEndCommands( cmds );
+		backEndFinishTime = Sys_Milliseconds();
+		backEnd.pc.msec = backEndFinishTime - backEndStartTime;
+		return;
+	}
 
 	// needed for editor rendering
 	RB_SetDefaultGLState();
