@@ -67,7 +67,9 @@ static void WIN_EnableAltTab( void ) {
 
 void WIN_Sizing(WORD side, RECT *rect)
 {
-	if ( !glConfig.isInitialized || glConfig.vidHeight <= 0 || glConfig.vidWidth <= 0 ) {
+	// The running predicate replaces the GL-only gate; the size terms stay, because a running
+	// render API with no valid size has nothing to scale.
+	if ( !R_RenderSystemRunning() || glConfig.vidHeight <= 0 || glConfig.vidWidth <= 0 ) {
 		return;
 	}
 
@@ -277,7 +279,10 @@ LONG WINAPI MainWndProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam ) {
 	int key;
 	switch( uMsg ) {
 		case WM_WINDOWPOSCHANGED:
-			if (glConfig.isInitialized) {
+			// Only the GL path owns glConfig as its window size. A modern surface must size itself;
+			// treating a D3D12 surface as a GL context here is the window-proc hazard in
+			// engine-integration.md 5.1.
+			if ( R_RenderSystemRunning() && glConfig.isInitialized ) {
 				RECT rect;
 				if (::GetClientRect(win32.hWnd, &rect)) {
 					glConfig.vidWidth = rect.right - rect.left;

@@ -627,7 +627,7 @@ BeginFrame
 void idRenderSystemLocal::BeginFrame( int windowWidth, int windowHeight ) {
 	setBufferCommand_t	*cmd;
 
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 
@@ -708,7 +708,7 @@ Returns the number of msec spent in the back end
 void idRenderSystemLocal::EndFrame( int *frontEndMsec, int *backEndMsec ) {
 	emptyCommand_t *cmd;
 
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 
@@ -800,7 +800,7 @@ down, but still valid.
 ================
 */
 void	idRenderSystemLocal::CropRenderSize( int width, int height, bool makePowerOfTwo, bool forceDimensions ) {
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 
@@ -880,7 +880,7 @@ UnCrop
 ================
 */
 void idRenderSystemLocal::UnCrop() {
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 
@@ -910,10 +910,14 @@ CaptureRenderToImage
 ================
 */
 void idRenderSystemLocal::CaptureRenderToImage( const char *imageName ) {
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
-	guiModel->EmitFullScreen();
+	// The HUD emission below is the GL 2D path. The D3D12 classic path emits its own
+	// display overlay as a separate ordered view; it must not run a GL entry point here.
+	if ( glConfig.isInitialized ) {
+		guiModel->EmitFullScreen();
+	}
 	guiModel->Clear();
 
 	if ( session->writeDemo ) {
@@ -950,15 +954,30 @@ CaptureRenderToFile
 ==============
 */
 void idRenderSystemLocal::CaptureRenderToFile( const char *fileName, bool fixAlpha ) {
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 
 	renderCrop_t *rc = &renderCrops[currentRenderCrop];
 
-	guiModel->EmitFullScreen();
+	// GL 2D emission is GL-only; the flush below is not, so a mid-frame capture keeps
+	// its position in the ordered stream on either path.
+	if ( glConfig.isInitialized ) {
+		guiModel->EmitFullScreen();
+	}
 	guiModel->Clear();
 	R_IssueRenderCommands();
+
+	// The queued frame has now been executed. The readback itself is a GL-only operation
+	// in this build: the portable RHI has a device readback but no engine colour-target
+	// handoff yet, so saying so is preferable to reading a texture that does not exist.
+	if ( !glConfig.isInitialized ) {
+		R_RenderApiFail( RA_STAGE_SURFACE,
+			"CaptureRenderToFile has no readback on the D3D12 classic path: the queued frame "
+			"was executed in order, but no file was written. The portable RHI colour-target "
+			"handoff (spec 004 T035/T080) is not delivered." );
+		return;
+	}
 
 	qglReadBuffer( GL_BACK );
 

@@ -332,7 +332,7 @@ SetColor
 =============
 */
 void idGuiModel::SetColor( float r, float g, float b, float a ) {
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 	if ( r == surf->color[0] && g == surf->color[1]
@@ -358,7 +358,7 @@ DrawStretchPic
 */
 void idGuiModel::DrawStretchPic( const idDrawVert *dverts, const glIndex_t *dindexes, int vertCount, int indexCount, const idMaterial *hShader, 
 									   bool clip, float min_x, float min_y, float max_x, float max_y ) {
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 	if ( !( dverts && dindexes && vertCount && indexCount && hShader ) ) {
@@ -460,7 +460,7 @@ void idGuiModel::DrawStretchPic( float x, float y, float w, float h, float s1, f
 	idDrawVert verts[4];
 	glIndex_t indexes[6];
 
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 	if ( !hShader ) {
@@ -571,7 +571,7 @@ void idGuiModel::DrawStretchTri( idVec2 p1, idVec2 p2, idVec2 p3, idVec2 t1, idV
 	int vertCount = 3;
 	int indexCount = 3;
 
-	if ( !glConfig.isInitialized ) {
+	if ( !R_RenderSystemRunning() ) {
 		return;
 	}
 	if ( !material ) {

@@ -31,6 +31,9 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "Image.h"
 #include "MegaTexture.h"
+// spec 004 Q2: render API selection, typed failure and the classic scene sink.
+// Header-only plain values; it must not include a standard header here.
+#include "RenderApi.h"
 
 class idRenderWorldLocal;
 
@@ -803,6 +806,13 @@ public:
 	class idGuiModel *		demoGuiModel;
 
 	unsigned short			gammaTable[256];	// brightness / gamma modify this
+
+	// spec 004 Q2 selection state. `renderApi` is the path this launch selected;
+	// a failed initialization is recorded in `renderApiFailure` and never rewrites
+	// r_renderApi or falls back on its own.
+	renderApi_t				renderApi;
+	renderApiResult_t		renderApiFailure;
+	bool					modernRenderApiRunning;
 };
 
 extern backEndState_t		backEnd;
