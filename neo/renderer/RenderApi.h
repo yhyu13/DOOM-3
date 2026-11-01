@@ -115,12 +115,43 @@ typedef struct {
 	int					translucentInteractions;
 } q2LightFacts_t;
 
+// Per-surface depth hack, forwarded with the same meaning the GL path reads from
+// drawSurf_t.space (draw_common.cpp:749-754, tr_render.cpp:176-206). The view
+// projection passed to beginView() is NOT pre-hacked, so the consumer applies the
+// hack for the packet and restores the projection afterwards. The weapon hack also
+// narrows the depth range to 0..0.5; the model hack keeps 0..1 and subtracts the
+// distance from the projection z offset.
+enum q2DepthHackKind_t {
+	Q2_DEPTH_HACK_NONE = 0,
+	Q2_DEPTH_HACK_WEAPON = 1,
+	Q2_DEPTH_HACK_MODEL = 2
+};
+
 /*
 	The port installs one sink. The engine calls it in the order it already
 	draws: the sorted drawSurfs array first (the port may replay it for the
 	depth fill, interaction and post-process phases), then each viewLight in
 	viewLights order. Every callback returns false to refuse the frame; the
 	engine then reports the refusal and never presents a partial frame.
+
+	beginView:
+	  `overlay` marks the display HUD: a separate 2D view at display resolution,
+	  appended after the 3D scene (O-11).
+	  `worldGui` is a view-level flag for a view that is itself a GUI view. The
+	  engine has no such view, so it is always false here; an in-world GUI is a
+	  surface inside a normal 3D view, which is the per-packet `worldGui` below.
+	  `projection` is the unhacked viewDef projection; per-packet depth-hack facts
+	  follow separately (see q2DepthHackKind_t).
+
+	drawPacket:
+	  `worldGui` is true for an in-world GUI surface. The engine derives it where the
+	  material and the space already resolve the GUI (R_AddDrawSurf, the same decision
+	  tr_light.cpp:1283-1297 makes) and records it on the drawSurf, so it is NOT an
+	  SS_GUI sort comparison: drawSurf_t.sort carries tr.sortOffset
+	  (tr_light.cpp:1195-1200), so equality with SS_GUI would only match the first
+	  surface added in a frame.
+	  `depthHackKind`/`modelDepthHack` are the real per-surface facts; the view
+	  projection is not pre-hacked and the consumer applies the hack itself.
 */
 typedef struct q2SceneSink_s {
 	void *		user;
@@ -132,8 +163,8 @@ typedef struct q2SceneSink_s {
 	bool		(*beginView)( void *user, unsigned int viewId, int x, int y, int width, int height,
 							  bool overlay, bool worldGui, const float projection[16] );
 	bool		(*drawPacket)( void *user, unsigned int surfaceId, const q2MaterialFacts_t *material,
-							   int vertexCount, int indexCount, bool depthHack, bool worldGui,
-							   bool postProcess );
+							   int vertexCount, int indexCount, int depthHackKind,
+							   float modelDepthHack, bool worldGui, bool postProcess );
 	bool		(*lightPacket)( void *user, const q2LightFacts_t *light );
 	bool		(*endView)( void *user );
 

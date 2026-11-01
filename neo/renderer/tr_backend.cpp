@@ -694,7 +694,27 @@ static bool RB_Q2EmitDrawSurf( const q2SceneSink_t *sink, const drawSurf_t *surf
 	RB_Q2MaterialFacts( surf->material, &facts );
 	facts.sort = surf->sort;	// the front end already applied the material/entity offset
 
-	const bool worldGui = ( view->viewEntitys != NULL ) && ( facts.sort == (float)SS_GUI );
+	// In-world GUI: R_AddDrawSurf resolves the material/space GUI and records DSF_GUI_SURFACE
+	// (tr_light.cpp:1283-1300), so the back end does not dereference space->entityDef and does
+	// not fall back to an SS_GUI sort comparison: drawSurf_t.sort carries tr.sortOffset
+	// (tr_light.cpp:1195-1200), so equality with SS_GUI would only match the first surface
+	// added in a frame. A display HUD is a separate 2D overlay view, not this flag.
+	const bool worldGui = ( view->viewEntitys != NULL ) &&
+		( ( surf->dsFlags & DSF_GUI_SURFACE ) != 0 );
+
+	// Depth-hack facts exactly as the GL path reads them (draw_common.cpp:749-754):
+	// the view projection is not pre-hacked, so the consumer applies the hack per packet.
+	int depthHackKind = Q2_DEPTH_HACK_NONE;
+	float modelDepthHack = 0.0f;
+	if ( surf->space != NULL ) {
+		if ( surf->space->weaponDepthHack ) {
+			depthHackKind = Q2_DEPTH_HACK_WEAPON;
+		} else if ( surf->space->modelDepthHack != 0.0f ) {
+			depthHackKind = Q2_DEPTH_HACK_MODEL;
+			modelDepthHack = surf->space->modelDepthHack;
+		}
+	}
+
 	const bool postProcess = ( facts.sort >= (float)SS_POST_PROCESS );
 
 	if ( sink->drawPacket == NULL ) {
@@ -702,7 +722,8 @@ static bool RB_Q2EmitDrawSurf( const q2SceneSink_t *sink, const drawSurf_t *surf
 			"the classic scene consumer has no draw callback" );
 	}
 	if ( !sink->drawPacket( sink->user, (unsigned int)( ++r_q2SurfaceSerial ), &facts,
-			surf->geo->numVerts, surf->geo->numIndexes, false, worldGui, postProcess ) ) {
+			surf->geo->numVerts, surf->geo->numIndexes, depthHackKind, modelDepthHack,
+			worldGui, postProcess ) ) {
 		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
 			"the classic scene consumer refused a draw packet" );
 	}
@@ -780,9 +801,11 @@ static bool RB_Q2SubmitView( const drawSurfsCommand_t *cmd ) {
 	}
 
 	const unsigned int viewId = (unsigned int)( ++r_q2ViewSerial );
-	// The projection handed over is the final one, including the weapon/model depth hack:
-	// this build applies the hack to the matrix before RC_DRAW_VIEW is recorded, so the
-	// consumer must not apply it a second time (classic-parity.md O-13).
+	// The projection is the unhacked viewDef projection. The weapon/model depth hack is a
+	// per-surface fact forwarded in drawPacket (draw_common.cpp:749-754, tr_render.cpp:176-206);
+	// the consumer applies it for that packet and restores the projection afterwards.
+	// `worldGui` at view level is false: the engine has no whole-GUI view, and an in-world GUI
+	// is a per-surface fact on the packet below.
 	if ( !sink->beginView( sink->user, viewId, x, y, width, height, overlay, false,
 			view->projectionMatrix ) ) {
 		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
