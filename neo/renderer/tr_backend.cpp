@@ -704,14 +704,16 @@ static bool RB_Q2EmitDrawSurf( const q2SceneSink_t *sink, const drawSurf_t *surf
 
 	// Depth-hack facts exactly as the GL path reads them (draw_common.cpp:749-754):
 	// the view projection is not pre-hacked, so the consumer applies the hack per packet.
+	// When both flags are set the GL path applies the weapon hack and then the model hack from
+	// the original projection, so the model hack is the effective one; match that precedence.
 	int depthHackKind = Q2_DEPTH_HACK_NONE;
 	float modelDepthHack = 0.0f;
 	if ( surf->space != NULL ) {
-		if ( surf->space->weaponDepthHack ) {
-			depthHackKind = Q2_DEPTH_HACK_WEAPON;
-		} else if ( surf->space->modelDepthHack != 0.0f ) {
+		if ( surf->space->modelDepthHack != 0.0f ) {
 			depthHackKind = Q2_DEPTH_HACK_MODEL;
 			modelDepthHack = surf->space->modelDepthHack;
+		} else if ( surf->space->weaponDepthHack ) {
+			depthHackKind = Q2_DEPTH_HACK_WEAPON;
 		}
 	}
 

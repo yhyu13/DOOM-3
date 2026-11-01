@@ -120,7 +120,9 @@ typedef struct {
 // projection passed to beginView() is NOT pre-hacked, so the consumer applies the
 // hack for the packet and restores the projection afterwards. The weapon hack also
 // narrows the depth range to 0..0.5; the model hack keeps 0..1 and subtracts the
-// distance from the projection z offset.
+// distance from the projection z offset. When both flags are set, the model hack is
+// the effective one: the GL path applies the model hack from the original projection
+// after the weapon hack, which overwrites it.
 enum q2DepthHackKind_t {
 	Q2_DEPTH_HACK_NONE = 0,
 	Q2_DEPTH_HACK_WEAPON = 1,
