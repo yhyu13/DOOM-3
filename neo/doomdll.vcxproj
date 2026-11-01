@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug with inlines and memory log|Win32">
@@ -246,6 +246,7 @@
     <ClInclude Include="renderer\ModelOverlay.h" />
     <ClInclude Include="renderer\qgl.h" />
     <ClInclude Include="renderer\qgl_linked.h" />
+    <ClInclude Include="renderer\RenderApi.h" />
     <ClInclude Include="renderer\RenderSystem.h" />
     <ClInclude Include="renderer\RenderWorld.h" />
     <ClInclude Include="renderer\RenderWorld_local.h" />
