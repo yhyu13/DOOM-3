@@ -29,6 +29,7 @@ If you have questions concerning this license or the applicable additional terms
 #pragma hdrstop
 
 #include "tr_local.h"
+#include <stddef.h>		// offsetof for the T080 surface snapshot
 
 
 frameData_t		*frameData;
@@ -618,25 +619,17 @@ extern idCVar r_showRenderApiTrace;
 
 static int						r_q2ViewSerial;
 static int						r_q2SurfaceSerial;
-static idList<const idImage *>	r_q2ImageRegistry;
 
 void R_Q2ResetImageRegistry( void ) {
-	r_q2ImageRegistry.Clear();
+	// The image identity registry is owned by Image_load.cpp so that the upload
+	// callback and CopyRender use one namespace for the same idImage.
+	R_Q2ResetImageUploadRegistry();
 	r_q2ViewSerial = 0;
 	r_q2SurfaceSerial = 0;
 }
 
 static unsigned int RB_Q2ImageIdentity( const idImage *image ) {
-	if ( image == NULL ) {
-		return 0;
-	}
-	for ( int i = 0; i < r_q2ImageRegistry.Num(); i++ ) {
-		if ( r_q2ImageRegistry[i] == image ) {
-			return (unsigned int)( i + 1 );
-		}
-	}
-	r_q2ImageRegistry.Append( image );
-	return (unsigned int)r_q2ImageRegistry.Num();
+	return R_Q2ImageIdentity( image );
 }
 
 static bool RB_Q2Refuse( renderApiStage_t stage, const char *detail ) {
@@ -673,10 +666,23 @@ static void RB_Q2MaterialFacts( const idMaterial *material, q2MaterialFacts_t *f
 	facts->noShadows = material->TestMaterialFlag( MF_NOSHADOWS );
 	facts->noSelfShadow = material->TestMaterialFlag( MF_NOSELFSHADOW );
 	facts->castsShadow = material->SurfaceCastsShadow();
+
+	// T081: the per-stage texture identity and the sampler state the image itself
+	// carries. The material stage does not override filter/repeat; the engine's
+	// idImage does (Image.h:232-233), so forward those facts rather than inventing
+	// a sampler. A stage with no image keeps id 0 and hasImage false.
+	facts->textures.numStages =
+		( facts->numStages < Q2_MAX_STAGE_TEXTURES ) ? facts->numStages : Q2_MAX_STAGE_TEXTURES;
 	for ( int i = 0; i < facts->numStages; i++ ) {
 		const shaderStage_t *stage = material->GetStage( i );
 		if ( stage->texture.image != NULL ) {
 			facts->hasTexture = true;
+			if ( i < facts->textures.numStages ) {
+				facts->textures.hasImage[i] = true;
+				facts->textures.imageId[i] = R_Q2ImageIdentity( stage->texture.image );
+				facts->textures.filter[i] = (int)stage->texture.image->filter;
+				facts->textures.repeat[i] = (int)stage->texture.image->repeat;
+			}
 		}
 		if ( stage->newStage != NULL ) {
 			facts->hasProgram = true;
@@ -719,6 +725,35 @@ static bool RB_Q2EmitDrawSurf( const q2SceneSink_t *sink, const drawSurf_t *surf
 
 	const bool postProcess = ( facts.sort >= (float)SS_POST_PROCESS );
 
+	// T080: the ordered world surface's geometry snapshot. The pointers reference
+	// the engine's live idDrawVert/index arrays and are valid only for this
+	// callback; the port copies what it keeps. The transform is the view entity's
+	// model-to-world matrix (tr_local.h:366), never a GL vertex-cache handle.
+	if ( sink->surfacePacket != NULL ) {
+		q2SurfaceGeometry_t geometry;
+		memset( &geometry, 0, sizeof( geometry ) );
+		geometry.vertexCount = surf->geo->numVerts;
+		geometry.indexCount = surf->geo->numIndexes;
+		geometry.vertexData = (const unsigned char *)surf->geo->verts;
+		geometry.vertexStride = (int)sizeof( idDrawVert );
+		geometry.positionOffset = (int)offsetof( idDrawVert, xyz );
+		geometry.normalOffset = (int)offsetof( idDrawVert, normal );
+		geometry.texCoordOffset = (int)offsetof( idDrawVert, st );
+		geometry.indexes = (const unsigned char *)surf->geo->indexes;
+		geometry.indexSize = (int)sizeof( glIndex_t );
+		if ( surf->space != NULL ) {
+			memcpy( geometry.transform, surf->space->modelMatrix, sizeof( geometry.transform ) );
+		} else {
+			geometry.transform[0] = geometry.transform[5] = 1.0f;
+			geometry.transform[10] = geometry.transform[15] = 1.0f;
+		}
+		if ( !sink->surfacePacket( sink->user, (unsigned int)( r_q2SurfaceSerial + 1 ), &geometry ) ) {
+			return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+				"the classic scene consumer refused world surface geometry" );
+		}
+		R_Q2TraceAdd( Q2_TRACE_SURFACE );
+	}
+
 	if ( sink->drawPacket == NULL ) {
 		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
 			"the classic scene consumer has no draw callback" );
@@ -734,6 +769,27 @@ static bool RB_Q2EmitDrawSurf( const q2SceneSink_t *sink, const drawSurf_t *surf
 	return true;
 }
 
+static bool RB_Q2EmitOneLight( const q2SceneSink_t *sink, const q2LightFacts_t &facts ) {
+	if ( sink->lightPacket == NULL ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer has no light callback" );
+	}
+	if ( !sink->lightPacket( sink->user, &facts ) ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer refused a viewLight" );
+	}
+	R_Q2TraceAdd( Q2_TRACE_LIGHT );
+	return true;
+}
+
+// T082: the interaction/stencil-shadow facts. The engine already decided which
+// surfaces are global shadows, local shadows, local interactions and global
+// interactions (Interaction.cpp:1155-1240), so the seam forwards that decision
+// as one packet per chain instead of asking the port to re-derive it. The
+// classic order is global shadows, local interactions, local shadows, global
+// interactions, translucent interactions (draw_arb2.cpp:243-323); the port
+// replays a packet per chain. A noShadows light, an ambient/fog/blend pass or a
+// light with no remaining chain emits one excluded packet and no volume.
 static bool RB_Q2EmitViewLight( const q2SceneSink_t *sink, const viewLight_t *viewLight ) {
 	if ( viewLight->lightShader == NULL || viewLight->lightDef == NULL ) {
 		return RB_Q2Refuse( RA_STAGE_COMMAND, "a viewLight reached the classic path without a light" );
@@ -757,16 +813,55 @@ static bool RB_Q2EmitViewLight( const q2SceneSink_t *sink, const viewLight_t *vi
 	facts.globalInteractions = RB_Q2CountChain( viewLight->globalInteractions );
 	facts.translucentInteractions = RB_Q2CountChain( viewLight->translucentInteractions );
 
-	if ( sink->lightPacket == NULL ) {
-		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
-			"the classic scene consumer has no light callback" );
-	}
-	if ( !sink->lightPacket( sink->user, &facts ) ) {
-		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
-			"the classic scene consumer refused a viewLight" );
+	// Ambient, fog and blend passes never own a stencil volume (draw_common.cpp:1578-1580).
+	const bool nonInteraction = facts.fogLight || facts.blendLight ||
+		( !facts.pointLight && !facts.parallel && !facts.hasProjection );
+	if ( nonInteraction || parms.noShadows ) {
+		facts.chainKind = 0;
+		facts.excluded = true;
+		facts.exclusionKind = parms.noShadows ? 1 : 2;
+		return RB_Q2EmitOneLight( sink, facts );
 	}
 
-	R_Q2TraceAdd( Q2_TRACE_LIGHT );
+	bool emitted = false;
+	if ( viewLight->globalShadows != NULL ) {
+		facts.chainKind = 1;
+		facts.chainSurfaceCount = RB_Q2CountChain( viewLight->globalShadows );
+		facts.chainMaterialNoShadows = false;
+		facts.chainMaterialNoSelfShadow = false;
+		facts.chainSameEntity = false;
+		facts.excluded = false;
+		facts.exclusionKind = 0;
+		if ( !RB_Q2EmitOneLight( sink, facts ) ) {
+			return false;
+		}
+		emitted = true;
+	}
+	if ( viewLight->localShadows != NULL ) {
+		facts.chainKind = 2;
+		facts.chainSurfaceCount = RB_Q2CountChain( viewLight->localShadows );
+		facts.chainMaterialNoShadows = false;
+		// The local chain exists because the interaction material has
+		// noSelfShadow (Interaction.cpp:1162,1235), so the casters may not shadow
+		// their own lit surface. This is a fact, not a guess.
+		facts.chainMaterialNoSelfShadow = true;
+		facts.chainSameEntity = false;
+		facts.excluded = false;
+		facts.exclusionKind = 0;
+		if ( !RB_Q2EmitOneLight( sink, facts ) ) {
+			return false;
+		}
+		emitted = true;
+	}
+
+	if ( !emitted ) {
+		// The light has interactions but the front end produced no shadow chain:
+		// no volume may be emitted. This is the CP-07 exclusion, not a missing packet.
+		facts.chainKind = 0;
+		facts.excluded = true;
+		facts.exclusionKind = 4;
+		return RB_Q2EmitOneLight( sink, facts );
+	}
 	return true;
 }
 

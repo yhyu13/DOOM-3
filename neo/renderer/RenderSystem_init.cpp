@@ -1916,12 +1916,14 @@ void R_Q2TraceReset( void ) {
 }
 
 void R_Q2TracePrint( const char *label ) {
-	common->Printf( "Q2 trace %s: views %d, overlays %d, draws %d, lights %d, refused %d, copies %d, targets %d, swaps %d\n",
+	common->Printf( "Q2 trace %s: views %d, overlays %d, draws %d, surfaces %d, images %d, poses %d, lights %d, refused %d, copies %d, targets %d, swaps %d\n",
 		label ? label : "",
 		r_q2TraceCounters[Q2_TRACE_VIEW], r_q2TraceCounters[Q2_TRACE_OVERLAY],
-		r_q2TraceCounters[Q2_TRACE_DRAW], r_q2TraceCounters[Q2_TRACE_LIGHT],
-		r_q2TraceCounters[Q2_TRACE_REFUSED], r_q2TraceCounters[Q2_TRACE_COPY],
-		r_q2TraceCounters[Q2_TRACE_TARGET], r_q2TraceCounters[Q2_TRACE_SWAP] );
+		r_q2TraceCounters[Q2_TRACE_DRAW], r_q2TraceCounters[Q2_TRACE_SURFACE],
+		r_q2TraceCounters[Q2_TRACE_IMAGE], r_q2TraceCounters[Q2_TRACE_POSE],
+		r_q2TraceCounters[Q2_TRACE_LIGHT], r_q2TraceCounters[Q2_TRACE_REFUSED],
+		r_q2TraceCounters[Q2_TRACE_COPY], r_q2TraceCounters[Q2_TRACE_TARGET],
+		r_q2TraceCounters[Q2_TRACE_SWAP] );
 	R_Q2TraceReset();
 }
 
@@ -2021,9 +2023,10 @@ void R_InitRenderApi( void ) {
 	if ( sink == NULL || sink->initialize == NULL ) {
 		R_RenderApiFail( RA_STAGE_SCENE_SINK,
 			"r_renderApi 1 selected the D3D12 classic path, but no backend-neutral scene consumer "
-			"is installed in this build (spec 004 T035/T080: the portable RHI still accepts no "
-			"geometry or texture submission). r_renderApi was not changed; relaunch with "
-			"r_renderApi 0 for the OpenGL reference path." );
+			"is installed in this build. The seam carries ordered world geometry, texture uploads, "
+			"shadow-chain exclusions and private poses (spec 004 T080-T082/T044), but no device "
+			"consumer is linked. r_renderApi was not changed; relaunch with r_renderApi 0 for the "
+			"OpenGL reference path." );
 		return;
 	}
 
@@ -2056,6 +2059,7 @@ void R_ShutdownRenderApi( void ) {
 		}
 		tr.modernRenderApiRunning = false;
 		R_Q2ResetImageRegistry();
+		R_Q3ResetPrivatePoses();
 		return;
 	}
 

@@ -32,6 +32,82 @@ If you have questions concerning this license or the applicable additional terms
 #include "tr_local.h"
 
 /*
+================================================================================
+
+	spec 004 (Q2) T081: texture upload and sampling metadata.
+
+	GenerateImage() is the 2D upload point for generated and file-loaded images.
+	The D3D12 classic path does not run the GL upload (glConfig.isInitialized is
+	false there), so this seam forwards the CPU bytes and the sampler state before
+	that early return instead of pretending a GL texture exists. The identity is
+	the one CopyRender uses, so a stage texture and a render target agree.
+
+	This is not a claim that the port uploaded the texture: the sink may refuse,
+	and a render target has no CPU pixels to forward.
+
+================================================================================
+*/
+
+static idList<const idImage *>	r_q2ImageUploadRegistry;
+
+unsigned int R_Q2ImageIdentity( const idImage *image ) {
+	if ( image == NULL ) {
+		return 0;
+	}
+	for ( int i = 0; i < r_q2ImageUploadRegistry.Num(); i++ ) {
+		if ( r_q2ImageUploadRegistry[i] == image ) {
+			return (unsigned int)( i + 1 );
+		}
+	}
+	r_q2ImageUploadRegistry.Append( image );
+	return (unsigned int)r_q2ImageUploadRegistry.Num();
+}
+
+void R_Q2ResetImageUploadRegistry( void ) {
+	r_q2ImageUploadRegistry.Clear();
+}
+
+void R_Q2EmitImageUpload( const idImage *image, const byte *pixels,
+						  int width, int height, int mipCount,
+						  int format, bool sRGB ) {
+	if ( !R_ModernRenderApiRunning() || image == NULL || pixels == NULL ||
+			width <= 0 || height <= 0 ) {
+		return;
+	}
+	const q2SceneSink_t *sink = R_Q2SceneSink();
+	if ( sink == NULL || sink->imageUpload == NULL ) {
+		return;
+	}
+
+	q2ImageUpload_t upload;
+	memset( &upload, 0, sizeof( upload ) );
+	upload.imageId = R_Q2ImageIdentity( image );
+	upload.name = image->imgName.c_str();
+	upload.width = width;
+	upload.height = height;
+	upload.mipCount = mipCount;
+	upload.format = format;
+	upload.sRGB = sRGB;
+	// The material stage does not override sampling; the engine image carries the
+	// filter/repeat (Image.h:232-233). magFilter uses the same value because the
+	// 2011 engine only exposes one filter choice per image.
+	upload.minFilter = (int)image->filter;
+	upload.magFilter = (int)image->filter;
+	upload.wrapS = (int)image->repeat;
+	upload.wrapT = (int)image->repeat;
+	upload.pixels = pixels;
+	upload.bytesPerRow = width * ( ( format == 0 ) ? 4 : 1 );
+
+	if ( !sink->imageUpload( sink->user, &upload ) ) {
+		R_Q2TraceAdd( Q2_TRACE_REFUSED );
+		R_RenderApiFail( RA_STAGE_COMMAND,
+			"the classic scene consumer refused an image upload" );
+		return;
+	}
+	R_Q2TraceAdd( Q2_TRACE_IMAGE );
+}
+
+/*
 PROBLEM: compressed textures may break the zero clamp rule!
 */
 
@@ -520,6 +596,13 @@ void idImage::GenerateImage( const byte *pic, int width, int height,
 	allowDownSize = allowDownSizeParm;
 	repeat = repeatParm;
 	depth = depthParm;
+
+	// T081: forward the CPU bytes and the sampler state before the GL-only
+	// early return below. In the D3D12 classic path glConfig.isInitialized is
+	// false, so this is the only point where the port can receive the texture.
+	if ( R_ModernRenderApiRunning() ) {
+		R_Q2EmitImageUpload( this, pic, width, height, 1, 0, false );
+	}
 
 	// if we don't have a rendering context, just return after we
 	// have filled in the parms.  We must have the values set, or
