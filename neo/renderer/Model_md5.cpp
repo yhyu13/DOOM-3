@@ -35,6 +35,212 @@ If you have questions concerning this license or the applicable additional terms
 static const char *MD5_SnapshotName = "_MD5_Snapshot_";
 
 
+/*
+================================================================================
+
+	spec 004 (Q3) T044: the private persisted previous pose.
+
+	idMD5Mesh::UpdateSurface regenerates the shared dynamic surface and may free
+	the old srfTriangles_t between frames. A motion vector must not read the
+	shared cache after that happens, and a subview must not overwrite the main
+	view's record. This store keeps a copy of the posed positions keyed by
+	(viewId, stable surface id) and a one-frame previous copy. The copy survives
+	the shared surface's regeneration/deletion because it owns its memory; a
+	generation mismatch returns no previous pose instead of stale vertices.
+
+	The engine also forwards the same snapshot through the sink's privatePose
+	callback so the portable SkinnedPoseHistory consumes the engine's pose rather
+	than a test vector.
+
+================================================================================
+*/
+
+typedef struct q3SurfaceKey_s {
+	const idMD5Mesh *	mesh;
+	int					surfaceId;
+	unsigned int		identity;
+} q3SurfaceKey_t;
+
+typedef struct q3SurfaceGeneration_s {
+	const idMD5Mesh *	mesh;
+	int					surfaceId;
+	unsigned int		generation;
+} q3SurfaceGeneration_t;
+
+typedef struct q3PrivatePoseEntry_s {
+	unsigned int		viewId;
+	unsigned int		surfaceId;
+	unsigned int		currentGeneration;
+	unsigned int		previousGeneration;
+	bool				hasPrevious;
+	idList<float>		current;			// 3 floats per vertex
+	idList<float>		previous;
+} q3PrivatePoseEntry_t;
+
+static idList<q3SurfaceKey_t>		r_q3SurfaceKeys;
+static idList<q3SurfaceGeneration_t>	r_q3SurfaceGenerations;
+static idList<q3PrivatePoseEntry_t>	r_q3PrivatePoses;
+
+static unsigned int R_Q3StableSurfaceId( const idMD5Mesh *mesh, int surfaceId ) {
+	for ( int i = 0; i < r_q3SurfaceKeys.Num(); i++ ) {
+		if ( r_q3SurfaceKeys[i].mesh == mesh && r_q3SurfaceKeys[i].surfaceId == surfaceId ) {
+			return r_q3SurfaceKeys[i].identity;
+		}
+	}
+	q3SurfaceKey_t key;
+	key.mesh = mesh;
+	key.surfaceId = surfaceId;
+	key.identity = (unsigned int)( r_q3SurfaceKeys.Num() + 1 );
+	r_q3SurfaceKeys.Append( key );
+	return key.identity;
+}
+
+// The generation advances only when the shared surface is (re)allocated, not on
+// every frame. A reused surface keeps its generation, so the previous pose stays
+// comparable; a regenerated one invalidates it.
+static unsigned int R_Q3NextGeneration( const idMD5Mesh *mesh, int surfaceId, bool regenerated ) {
+	for ( int i = 0; i < r_q3SurfaceGenerations.Num(); i++ ) {
+		q3SurfaceGeneration_t &entry = r_q3SurfaceGenerations[i];
+		if ( entry.mesh == mesh && entry.surfaceId == surfaceId ) {
+			if ( regenerated ) {
+				entry.generation++;
+			}
+			return entry.generation;
+		}
+	}
+	q3SurfaceGeneration_t entry;
+	entry.mesh = mesh;
+	entry.surfaceId = surfaceId;
+	entry.generation = 1;
+	r_q3SurfaceGenerations.Append( entry );
+	return entry.generation;
+}
+
+static unsigned int R_Q3ViewKind( void ) {
+	if ( tr.viewDef == NULL ) {
+		return 0;
+	}
+	if ( tr.viewDef->isMirror ) {
+		return 1;
+	}
+	if ( tr.viewDef->isSubview ) {
+		return 2;
+	}
+	return 0;
+}
+
+static q3PrivatePoseEntry_t *R_Q3FindPoseEntry( unsigned int viewId, unsigned int surfaceId,
+												bool create ) {
+	for ( int i = 0; i < r_q3PrivatePoses.Num(); i++ ) {
+		if ( r_q3PrivatePoses[i].viewId == viewId &&
+				r_q3PrivatePoses[i].surfaceId == surfaceId ) {
+			return &r_q3PrivatePoses[i];
+		}
+	}
+	if ( !create ) {
+		return NULL;
+	}
+	q3PrivatePoseEntry_t entry;
+	entry.viewId = viewId;
+	entry.surfaceId = surfaceId;
+	entry.currentGeneration = 0;
+	entry.previousGeneration = 0;
+	entry.hasPrevious = false;
+	r_q3PrivatePoses.Append( entry );
+	return &r_q3PrivatePoses[r_q3PrivatePoses.Num() - 1];
+}
+
+static void R_Q3CommitPrivatePose( const idMD5Mesh *mesh, const modelSurface_t *surf,
+								   const srfTriangles_t *tri, unsigned int generation ) {
+	// The GL reference path has no Q3 motion consumer; do not copy every posed
+	// surface there. The private store is a modern-path facility.
+	if ( !R_ModernRenderApiRunning() ) {
+		return;
+	}
+	if ( mesh == NULL || surf == NULL || tri == NULL || tri->verts == NULL ||
+			tri->numVerts <= 0 ) {
+		return;
+	}
+
+	const unsigned int viewId = ( tr.viewDef != NULL ) ?
+		(unsigned int)tr.viewDef->renderView.viewID : 0u;
+	const unsigned int viewKind = R_Q3ViewKind();
+	const unsigned int surfaceId = R_Q3StableSurfaceId( mesh, surf->id );
+	q3PrivatePoseEntry_t *entry = R_Q3FindPoseEntry( viewId, surfaceId, true );
+	if ( entry == NULL ) {
+		return;
+	}
+
+	// The old current pose becomes the previous one. This is the copy that
+	// survives the shared cache being freed later in the frame.
+	if ( entry->current.Num() > 0 ) {
+		entry->previous.SetNum( entry->current.Num() );
+		memcpy( entry->previous.Ptr(), entry->current.Ptr(),
+				entry->current.Num() * sizeof( float ) );
+		entry->previousGeneration = entry->currentGeneration;
+		entry->hasPrevious = true;
+	}
+
+	entry->current.SetNum( tri->numVerts * 3 );
+	for ( int i = 0; i < tri->numVerts; i++ ) {
+		entry->current[i * 3 + 0] = tri->verts[i].xyz[0];
+		entry->current[i * 3 + 1] = tri->verts[i].xyz[1];
+		entry->current[i * 3 + 2] = tri->verts[i].xyz[2];
+	}
+	entry->currentGeneration = generation;
+
+	const q2SceneSink_t *sink = R_Q2SceneSink();
+	if ( sink != NULL && sink->privatePose != NULL ) {
+		q2PrivatePose_t pose;
+		memset( &pose, 0, sizeof( pose ) );
+		pose.viewId = viewId;
+		pose.viewKind = viewKind;
+		pose.surfaceId = surfaceId;
+		pose.generation = generation;
+		pose.vertexCount = tri->numVerts;
+		pose.positions = entry->current.Ptr();
+		if ( !sink->privatePose( sink->user, &pose ) ) {
+			R_Q2TraceAdd( Q2_TRACE_REFUSED );
+			R_RenderApiFail( RA_STAGE_COMMAND,
+				"the classic scene consumer refused a private skinned pose" );
+			return;
+		}
+		R_Q2TraceAdd( Q2_TRACE_POSE );
+	}
+}
+
+bool R_Q3PreviousPrivatePose( unsigned int viewId, unsigned int surfaceId,
+							  unsigned int generation, int maxVerts,
+							  float *positions, int *numVerts ) {
+	if ( numVerts != NULL ) {
+		*numVerts = 0;
+	}
+	if ( positions == NULL || maxVerts <= 0 ) {
+		return false;
+	}
+	q3PrivatePoseEntry_t *entry = R_Q3FindPoseEntry( viewId, surfaceId, false );
+	if ( entry == NULL || !entry->hasPrevious ||
+			entry->previousGeneration != generation ) {
+		return false;
+	}
+	const int count = entry->previous.Num() / 3;
+	if ( count <= 0 || count > maxVerts ) {
+		return false;
+	}
+	memcpy( positions, entry->previous.Ptr(), entry->previous.Num() * sizeof( float ) );
+	if ( numVerts != NULL ) {
+		*numVerts = count;
+	}
+	return true;
+}
+
+void R_Q3ResetPrivatePoses( void ) {
+	r_q3SurfaceKeys.Clear();
+	r_q3SurfaceGenerations.Clear();
+	r_q3PrivatePoses.Clear();
+}
+
+
 /***********************************************************************
 
 	idMD5Mesh
@@ -280,6 +486,16 @@ void idMD5Mesh::UpdateSurface( const struct renderEntity_s *ent, const idJointMa
 	tr.pc.c_deformedVerts += deformInfo->numOutputVerts;
 	tr.pc.c_deformedIndexes += deformInfo->numIndexes;
 
+	// T044: the generation advances only when the shared surface is allocated or
+	// its vertex/index counts change. Reusing the same surface must keep the
+	// previous pose comparable to the current one.
+	const bool trackPose = R_ModernRenderApiRunning();
+	const bool poseRegenerated = trackPose && ( ( surf->geometry == NULL ) ||
+		( surf->geometry->numVerts != deformInfo->numOutputVerts ) ||
+		( surf->geometry->numIndexes != deformInfo->numIndexes ) );
+	const unsigned int poseGeneration = trackPose ?
+		R_Q3NextGeneration( this, surf->id, poseRegenerated ) : 0;
+
 	surf->shader = shader;
 
 	if ( surf->geometry ) {
@@ -344,6 +560,11 @@ void idMD5Mesh::UpdateSurface( const struct renderEntity_s *ent, const idJointMa
 		// set face planes, vertex normals, tangents
 		R_DeriveTangents( tri );
 	}
+
+	// T044: snapshot the posed vertices after the shared surface is complete.
+	// This is the last point at which tri->verts is valid for this view; the
+	// private copy survives a later R_FreeStaticTriSurf of the shared cache.
+	R_Q3CommitPrivatePose( this, surf, tri, poseGeneration );
 }
 
 /*

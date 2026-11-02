@@ -256,6 +256,19 @@ public:
 	int					refCount;				// overall ref count
 };
 
+// spec 004 (Q2) T081: the engine-side half of the texture-upload seam.
+//
+// These are declared here, not in RenderApi.h, because they name idImage. The
+// sink callback they feed still carries only a numeric identity, a value-only
+// q2ImageUpload_t, so no idImage* crosses the backend boundary. The identity is
+// shared with CopyRender (tr_backend.cpp) so a stage texture and a render target
+// use one namespace.
+unsigned int	R_Q2ImageIdentity( const idImage *image );
+void			R_Q2ResetImageUploadRegistry( void );
+void			R_Q2EmitImageUpload( const idImage *image, const byte *pixels,
+									int width, int height, int mipCount,
+									int format, bool sRGB );
+
 ID_INLINE idImage::idImage() {
 	texnum = TEXTURE_NOT_LOADED;
 	partialImage = NULL;
