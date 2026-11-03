@@ -208,6 +208,8 @@ EmitToCurrentView
 void idGuiModel::EmitToCurrentView( float modelMatrix[16], bool depthHack ) {
 	float	modelViewMatrix[16];
 
+	// spec 004 O-12: the caller (R_RenderGuiSurf) marks the surfaces emitted here as
+	// DSF_GUI_SURFACE. EmitFullScreen below is the display overlay, not a world GUI.
 	myGlMultMatrix( modelMatrix, tr.viewDef->worldSpace.modelViewMatrix, 
 			modelViewMatrix );
 
