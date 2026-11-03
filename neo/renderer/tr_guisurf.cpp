@@ -174,7 +174,18 @@ void R_RenderGuiSurf( idUserInterface *gui, drawSurf_t *drawSurf ) {
 	// call the gui, which will call the 2D drawing functions
 	tr.guiModel->Clear();
 	gui->Redraw( tr.viewDef->renderView.time );
+
+	// spec 004 O-12: the quads below are the in-world GUI's own surfaces. R_AddDrawSurf
+	// only marks the world screen surface that resolves the GUI material, so record the
+	// fact here, where the generated quads are added to the current 3D view. The ordered
+	// classic scene seam then forwards worldGui=true for each of them instead of guessing
+	// from a sort range. A display HUD goes through EmitFullScreen and stays a separate
+	// overlay view.
+	const int firstGuiSurf = tr.viewDef->numDrawSurfs;
 	tr.guiModel->EmitToCurrentView( modelMatrix, drawSurf->space->weaponDepthHack );
+	for ( int i = firstGuiSurf; i < tr.viewDef->numDrawSurfs; i++ ) {
+		tr.viewDef->drawSurfs[i]->dsFlags |= DSF_GUI_SURFACE;
+	}
 	tr.guiModel->Clear();
 
 	tr.guiRecursionLevel--;

@@ -1916,12 +1916,13 @@ void R_Q2TraceReset( void ) {
 }
 
 void R_Q2TracePrint( const char *label ) {
-	common->Printf( "Q2 trace %s: views %d, overlays %d, draws %d, surfaces %d, images %d, poses %d, lights %d, refused %d, copies %d, targets %d, swaps %d\n",
+	common->Printf( "Q2 trace %s: views %d, overlays %d, draws %d, surfaces %d, images %d, poses %d, lights %d, volumes %d, refused %d, copies %d, targets %d, swaps %d\n",
 		label ? label : "",
 		r_q2TraceCounters[Q2_TRACE_VIEW], r_q2TraceCounters[Q2_TRACE_OVERLAY],
 		r_q2TraceCounters[Q2_TRACE_DRAW], r_q2TraceCounters[Q2_TRACE_SURFACE],
 		r_q2TraceCounters[Q2_TRACE_IMAGE], r_q2TraceCounters[Q2_TRACE_POSE],
-		r_q2TraceCounters[Q2_TRACE_LIGHT], r_q2TraceCounters[Q2_TRACE_REFUSED],
+		r_q2TraceCounters[Q2_TRACE_LIGHT], r_q2TraceCounters[Q2_TRACE_SHADOW_VOLUME],
+		r_q2TraceCounters[Q2_TRACE_REFUSED],
 		r_q2TraceCounters[Q2_TRACE_COPY], r_q2TraceCounters[Q2_TRACE_TARGET],
 		r_q2TraceCounters[Q2_TRACE_SWAP] );
 	R_Q2TraceReset();

@@ -690,6 +690,29 @@ static void RB_Q2MaterialFacts( const idMaterial *material, q2MaterialFacts_t *f
 	}
 }
 
+// The value-only snapshot of one engine surface. The pointers reference the
+// live idDrawVert/index arrays and stay valid only for the callback; the port
+// copies what it keeps. The transform is the view entity's model-to-world
+// matrix (tr_local.h:366), never a GL vertex-cache handle.
+static void RB_Q2FillSurfaceGeometry( const drawSurf_t *surf, q2SurfaceGeometry_t *geometry ) {
+	memset( geometry, 0, sizeof( *geometry ) );
+	geometry->vertexCount = surf->geo->numVerts;
+	geometry->indexCount = surf->geo->numIndexes;
+	geometry->vertexData = (const unsigned char *)surf->geo->verts;
+	geometry->vertexStride = (int)sizeof( idDrawVert );
+	geometry->positionOffset = (int)offsetof( idDrawVert, xyz );
+	geometry->normalOffset = (int)offsetof( idDrawVert, normal );
+	geometry->texCoordOffset = (int)offsetof( idDrawVert, st );
+	geometry->indexes = (const unsigned char *)surf->geo->indexes;
+	geometry->indexSize = (int)sizeof( glIndex_t );
+	if ( surf->space != NULL ) {
+		memcpy( geometry->transform, surf->space->modelMatrix, sizeof( geometry->transform ) );
+	} else {
+		geometry->transform[0] = geometry->transform[5] = 1.0f;
+		geometry->transform[10] = geometry->transform[15] = 1.0f;
+	}
+}
+
 static bool RB_Q2EmitDrawSurf( const q2SceneSink_t *sink, const drawSurf_t *surf,
 							  const viewDef_t *view ) {
 	if ( surf == NULL || surf->geo == NULL ) {
@@ -725,28 +748,10 @@ static bool RB_Q2EmitDrawSurf( const q2SceneSink_t *sink, const drawSurf_t *surf
 
 	const bool postProcess = ( facts.sort >= (float)SS_POST_PROCESS );
 
-	// T080: the ordered world surface's geometry snapshot. The pointers reference
-	// the engine's live idDrawVert/index arrays and are valid only for this
-	// callback; the port copies what it keeps. The transform is the view entity's
-	// model-to-world matrix (tr_local.h:366), never a GL vertex-cache handle.
+	// T080: the ordered world surface's geometry snapshot.
 	if ( sink->surfacePacket != NULL ) {
 		q2SurfaceGeometry_t geometry;
-		memset( &geometry, 0, sizeof( geometry ) );
-		geometry.vertexCount = surf->geo->numVerts;
-		geometry.indexCount = surf->geo->numIndexes;
-		geometry.vertexData = (const unsigned char *)surf->geo->verts;
-		geometry.vertexStride = (int)sizeof( idDrawVert );
-		geometry.positionOffset = (int)offsetof( idDrawVert, xyz );
-		geometry.normalOffset = (int)offsetof( idDrawVert, normal );
-		geometry.texCoordOffset = (int)offsetof( idDrawVert, st );
-		geometry.indexes = (const unsigned char *)surf->geo->indexes;
-		geometry.indexSize = (int)sizeof( glIndex_t );
-		if ( surf->space != NULL ) {
-			memcpy( geometry.transform, surf->space->modelMatrix, sizeof( geometry.transform ) );
-		} else {
-			geometry.transform[0] = geometry.transform[5] = 1.0f;
-			geometry.transform[10] = geometry.transform[15] = 1.0f;
-		}
+		RB_Q2FillSurfaceGeometry( surf, &geometry );
 		if ( !sink->surfacePacket( sink->user, (unsigned int)( r_q2SurfaceSerial + 1 ), &geometry ) ) {
 			return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
 				"the classic scene consumer refused world surface geometry" );
@@ -779,6 +784,68 @@ static bool RB_Q2EmitOneLight( const q2SceneSink_t *sink, const q2LightFacts_t &
 			"the classic scene consumer refused a viewLight" );
 	}
 	R_Q2TraceAdd( Q2_TRACE_LIGHT );
+	return true;
+}
+
+static int RB_Q2CollectChainGeometry( const drawSurf_t *chain,
+									  idList<q2SurfaceGeometry_t> &geometry ) {
+	for ( ; chain != NULL; chain = chain->nextOnLight ) {
+		if ( chain->geo == NULL || chain->geo->numVerts <= 0 ) {
+			continue;
+		}
+		q2SurfaceGeometry_t snapshot;
+		RB_Q2FillSurfaceGeometry( chain, &snapshot );
+		geometry.Append( snapshot );
+	}
+	return geometry.Num();
+}
+
+// T082: the shadow-volume packet for one chain. The front end already produced
+// the caster chain (globalShadows/localShadows) and the interaction chain the
+// volume shades (globalInteractions/localInteractions), so the seam forwards
+// those surfaces instead of asking the port to re-derive a volume. The classic
+// stencil pass projects and draws the same chain twice, once per face
+// orientation (draw_arb2.cpp RB_StencilShadowPass), so `back` and `front` are
+// the same snapshot by construction; `shade` is the lit chain.
+//
+// The packet is sent immediately before the lightPacket for the same chain. An
+// absent callback means the consumer does not accept volume geometry, and the
+// engine then emits no packet rather than refusing a frame it can still draw.
+static bool RB_Q2EmitShadowVolume( const q2SceneSink_t *sink,
+								  const drawSurf_t *volumeChain,
+								  const drawSurf_t *shadeChain, int chainKind ) {
+	if ( sink->shadowVolumePacket == NULL ) {
+		return true;
+	}
+
+	idList<q2SurfaceGeometry_t> volume;
+	if ( RB_Q2CollectChainGeometry( volumeChain, volume ) == 0 ) {
+		// No caster geometry means no volume. The light packet still carries the
+		// chain facts, so the port is not told to invent one.
+		return true;
+	}
+	idList<q2SurfaceGeometry_t> shade;
+	RB_Q2CollectChainGeometry( shadeChain, shade );
+
+	q2ShadowVolumePacket_t packet;
+	memset( &packet, 0, sizeof( packet ) );
+	packet.chainKind = chainKind;
+	// The viewLight carries no engine colour for the shade pass; the classic path
+	// takes it from shader registers. Forward the neutral white the synthetic
+	// contract uses rather than inventing a light colour.
+	packet.tint[0] = packet.tint[1] = packet.tint[2] = packet.tint[3] = 1.0f;
+	packet.backCount = volume.Num();
+	packet.back = volume.Ptr();
+	packet.frontCount = volume.Num();
+	packet.front = volume.Ptr();
+	packet.shadeCount = shade.Num();
+	packet.shade = shade.Num() > 0 ? shade.Ptr() : NULL;
+
+	if ( !sink->shadowVolumePacket( sink->user, &packet ) ) {
+		return RB_Q2Refuse( RA_STAGE_SCENE_SINK,
+			"the classic scene consumer refused a shadow-volume packet" );
+	}
+	R_Q2TraceAdd( Q2_TRACE_SHADOW_VOLUME );
 	return true;
 }
 
@@ -825,6 +892,10 @@ static bool RB_Q2EmitViewLight( const q2SceneSink_t *sink, const viewLight_t *vi
 
 	bool emitted = false;
 	if ( viewLight->globalShadows != NULL ) {
+		if ( !RB_Q2EmitShadowVolume( sink, viewLight->globalShadows,
+				viewLight->globalInteractions, 1 ) ) {
+			return false;
+		}
 		facts.chainKind = 1;
 		facts.chainSurfaceCount = RB_Q2CountChain( viewLight->globalShadows );
 		facts.chainMaterialNoShadows = false;
@@ -838,6 +909,10 @@ static bool RB_Q2EmitViewLight( const q2SceneSink_t *sink, const viewLight_t *vi
 		emitted = true;
 	}
 	if ( viewLight->localShadows != NULL ) {
+		if ( !RB_Q2EmitShadowVolume( sink, viewLight->localShadows,
+				viewLight->localInteractions, 2 ) ) {
+			return false;
+		}
 		facts.chainKind = 2;
 		facts.chainSurfaceCount = RB_Q2CountChain( viewLight->localShadows );
 		facts.chainMaterialNoShadows = false;
