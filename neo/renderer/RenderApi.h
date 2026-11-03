@@ -200,6 +200,35 @@ typedef struct {
 	const float *		positions;
 } q2PrivatePose_t;
 
+// Presence marker for consumers that are built against more than one engine
+// pin. A superproject pin without this macro has a seam that cannot carry a
+// volume, so the port must not register the callback against that header.
+#define Q2_SEAM_SHADOW_VOLUME 1
+
+// One shadow-volume chain packet (T082). It is sent immediately before the
+// lightPacket it belongs to, exactly as surfacePacket precedes its draw packet:
+// one packet per chain, in the chain order the classic back end draws.
+//
+// `back` and `front` are the chain's caster surfaces. The classic stencil pass
+// draws the same projected volume twice with opposite culling (back faces
+// increment, front faces decrement), so the engine forwards the same chain for
+// both; the port must not infer a second mesh. `shade` is the interaction chain
+// the volume shadows. Each array points into engine frame memory and is valid
+// only for the callback, and each entry carries its own model-to-world
+// transform. `tint` is the light's shade tint; the classic path has no engine
+// colour on the viewLight, so the seam forwards white until it carries one.
+// An excluded light emits no shadow-volume packet at all.
+typedef struct {
+	int							chainKind;		// 1 global, 2 local
+	float						tint[4];
+	int							backCount;
+	const q2SurfaceGeometry_t *	back;
+	int							frontCount;
+	const q2SurfaceGeometry_t *	front;
+	int							shadeCount;
+	const q2SurfaceGeometry_t *	shade;
+} q2ShadowVolumePacket_t;
+
 // Per-surface depth hack, forwarded with the same meaning the GL path reads from
 // drawSurf_t.space (draw_common.cpp:749-754, tr_render.cpp:176-206). The view
 // projection passed to beginView() is NOT pre-hacked, so the consumer applies the
@@ -269,6 +298,7 @@ typedef struct q2SceneSink_s {
 							   int vertexCount, int indexCount, int depthHackKind,
 							   float modelDepthHack, bool worldGui, bool postProcess );
 	bool		(*lightPacket)( void *user, const q2LightFacts_t *light );
+	bool		(*shadowVolumePacket)( void *user, const q2ShadowVolumePacket_t *packet );
 	bool		(*privatePose)( void *user, const q2PrivatePose_t *pose );
 	bool		(*endView)( void *user );
 
@@ -312,6 +342,7 @@ enum q2TraceCounter_t {
 	Q2_TRACE_IMAGE,
 	Q2_TRACE_POSE,
 	Q2_TRACE_LIGHT,
+	Q2_TRACE_SHADOW_VOLUME,
 	Q2_TRACE_REFUSED,
 	Q2_TRACE_COPY,
 	Q2_TRACE_TARGET,
